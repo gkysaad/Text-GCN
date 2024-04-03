@@ -22,14 +22,14 @@ def train(train_data, val_data, saver):
         t = time.time()
         model.train()
         model.zero_grad()
-        loss, preds_train = model(pyg_graph, train_data)
+        loss, preds_train = model(pyg_graph, train_data, epoch)
         loss.backward()
         optimizer.step()
         loss = loss.item()
         if COMET_EXPERIMENT:
             COMET_EXPERIMENT.log_metric("loss", loss, epoch + 1)
         with torch.no_grad():
-            val_loss, preds_val = model(pyg_graph, val_data)
+            val_loss, preds_val = model(pyg_graph, val_data, -1)
             val_loss = val_loss.item()
             eval_res_val = eval(preds_val, val_data)
             print("Epoch: {:04d}, Train Loss: {:.5f}, Time: {:.5f}".format(epoch, loss, time.time() - t))

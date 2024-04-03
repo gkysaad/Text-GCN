@@ -57,7 +57,10 @@ def clean_documents(docs, word_counts, dataset):
     for doc in docs:
         doc = clean_doc(doc, dataset)
         words = doc.split()
-        words = [word for word in words if word not in stop_words and word_counts[word] >= 5]
+        thresh = 5
+        if "mr" in dataset:
+            thresh = 1
+        words = [word for word in words if word not in stop_words and word_counts[word] >= thresh]
         doc = ' '.join(words).strip()
         if doc != '':
             ret.append(' '.join(words).strip())
@@ -111,6 +114,6 @@ def clean_doc(string, dataset):
 
 if __name__ == "__main__":
 
-    dataset = 'twitter_asian_prejudice_no_hashtag'
-    out = clean_doc('"😷before you wear n95 masks, you should look into getting a fit test. because unlike surgical masks, one size does not fit all for n95 masks. having best fit n95 for your face will ensure a good face seal for protection.  https://t.co/xm2maqsp8w  #HASHTAG HASHTAG_EASTASIA+VIRUS https://t.co/iiszmr3wgc"', dataset)
+    dataset = 'mr'
+    # out = clean_doc('"😷before you wear n95 masks, you should look into getting a fit test. because unlike surgical masks, one size does not fit all for n95 masks. having best fit n95 for your face will ensure a good face seal for protection.  https://t.co/xm2maqsp8w  #HASHTAG HASHTAG_EASTASIA+VIRUS https://t.co/iiszmr3wgc"', dataset)
     clean_data(dataset)

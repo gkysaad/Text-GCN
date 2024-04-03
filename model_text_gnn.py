@@ -3,47 +3,211 @@ from config import FLAGS
 import torch.nn.functional as F
 import torch.nn as nn
 import torch
+from torch.utils.data import DataLoader
+from torch.optim import Adam
+from transformers import get_scheduler
 from torch.nn import Parameter
 from torch_scatter import scatter_add
 from torch_geometric.nn.conv import MessagePassing
 from torch_geometric.utils import remove_self_loops, add_self_loops, softmax
 from torch_geometric.nn.inits import glorot, zeros
 
+from sentence_transformers import SentenceTransformer
+# import hf text classification
+from transformers import AutoModelForSequenceClassification, AutoTokenizer, TrainingArguments, Trainer
+
+import numpy as np
+import evaluate
+from tqdm.auto import tqdm
+
+# import train test split
+from sklearn.model_selection import train_test_split
+
+metric = evaluate.load("accuracy")
+device = torch.device("cpu")
 
 class TextGNN(nn.Module):
-    def __init__(self, pred_type, node_embd_type, num_layers, layer_dim_list, act, bn, num_labels, class_weights, dropout):
+    def __init__(self, pred_type, node_embd_type, num_layers, layer_dim_list, act, bn, num_labels, class_weights, dropout, llm=False, llm_model=None):
         super(TextGNN, self).__init__()
         self.node_embd_type = node_embd_type
         self.layer_dim_list = layer_dim_list
         self.num_layers = num_layers
         self.dropout = dropout
-        if pred_type == 'softmax':
+        self.num_labels = num_labels
+        if pred_type == 'softmax' or pred_type == 'avg_softmax_ensemble':
             assert layer_dim_list[-1] == num_labels
         elif pred_type == 'mlp':
-            dims = self._calc_mlp_dims(layer_dim_list[-1], num_labels)
-            self.mlp = MLP(layer_dim_list[-1], num_labels, num_hidden_lyr=len(dims), hidden_channels=dims, bn=False)
+            num_dims = layer_dim_list[-1]
+            if eval(llm):
+                num_dims = layer_dim_list[-2]
+                if "MiniLM" in llm_model:
+                    num_dims += 384
+                elif "tas-b" in llm_model:
+                    num_dims += 768
+            dims = self._calc_mlp_dims(num_dims, num_labels)
+            self.mlp = MLP(num_dims, num_labels, num_hidden_lyr=len(dims), hidden_channels=dims, bn=False)
+        elif pred_type in ["sm_ensemble_mlp", "full_ensemble_mlp"]:
+            num_dims = layer_dim_list[-1] * 2
+            if pred_type == "full_ensemble_mlp":
+                if "tas-b" in llm_model:
+                    num_dims += 768
+                num_dims += layer_dim_list[-2]
+                assert num_dims == num_labels*2 + 768 + layer_dim_list[-2]
+            else:
+                assert num_dims == num_labels*2
+            assert eval(llm)
+            dims = self._calc_mlp_dims(num_dims, num_labels)
+            self.mlp = MLP(num_dims, num_labels, num_hidden_lyr=len(dims), hidden_channels=dims, bn=False)
+        elif pred_type == "embed_ensemble_mlp":
+            num_dims = 768
+            num_dims += layer_dim_list[-2]
+            assert num_dims == layer_dim_list[-2] + 768
+            dims = self._calc_mlp_dims(num_dims, num_labels)
+            self.mlp = MLP(num_dims, num_labels, num_hidden_lyr=len(dims), hidden_channels=dims, bn=False)
+        elif pred_type == "llm_embed_mlp":
+            num_dims = 768
+            dims = self._calc_mlp_dims(num_dims, num_labels)
+            self.mlp = MLP(num_dims, num_labels, num_hidden_lyr=len(dims), hidden_channels=dims, bn=False)
+
         self.pred_type = pred_type
         assert len(layer_dim_list) == (num_layers + 1)
         self.act = act
         self.bn = bn
         self.layers = self._create_node_embd_layers()
         self.loss = nn.CrossEntropyLoss(weight=class_weights)
+        llm = eval(llm)
+        if llm != False and pred_type not in ["sm_ensemble_mlp", "full_ensemble_mlp", "embed_ensemble_mlp", "llm_embed_mlp", "avg_softmax_ensemble"]:
+            print(f'Using LLM: {llm_model}')
+            self.llm = SentenceTransformer(llm_model)
+        if pred_type in ["sm_ensemble_mlp", "full_ensemble_mlp", "embed_ensemble_mlp", "avg_softmax_ensemble", "llm_embed_mlp"]:
+            self.tokenizer = AutoTokenizer.from_pretrained(llm_model)
+            self.llm = AutoModelForSequenceClassification.from_pretrained( \
+                llm_model, num_labels=num_labels, output_hidden_states=True)
+                                                                          
 
-    def forward(self, pyg_graph, dataset):
+    def forward(self, pyg_graph, dataset, epoch_num):
         acts = [pyg_graph.x]
         for i, layer in enumerate(self.layers):
             ins = acts[-1]
             outs = layer(ins, pyg_graph)
             acts.append(outs)
-
-        return self._loss(acts[-1], dataset)
-
-    def _loss(self, ins, dataset):
+        
+        last_layer = acts[-1]
+        
         pred_inds = dataset.node_ids
+        if self.pred_type in  ["sm_ensemble_mlp", "full_ensemble_mlp", "avg_softmax_ensemble", "embed_ensemble_mlp", "llm_embed_mlp"]:
+            # add code to fine-tune LLM
+            if epoch_num == 0:
+                print("Fine-tuning LLM on epoch 0")
+                self.fine_tune_llm(dataset, pred_inds, self.llm)
+
+
+        return self._loss(last_layer, dataset, acts[-2])
+    
+    def compute_metrics(eval_pred):
+        logits, labels = eval_pred
+        predictions = np.argmax(logits, axis=-1)
+        return metric.compute(predictions=predictions, references=labels)
+    
+    def tokenise(self, docs):
+        return self.tokenizer(docs, padding=True,  return_tensors="pt")
+
+    def fine_tune_llm(self, dataset, train_inds, model):
+        max_length = 512
+        # split train_inds into train and val
+        train_inds, val_inds = train_test_split(train_inds, test_size=0.1)
+
+        train_docs = [dataset.docs[i] for i in train_inds]
+        val_docs = [dataset.docs[i] for i in val_inds]
+        train_labels = dataset.label_inds[train_inds]
+        val_labels = dataset.label_inds[val_inds]
+
+        train_encodings = self.tokenizer(train_docs, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+        val_encodings = self.tokenizer(val_docs, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+
+        train_dataset = [{"input_ids": train_encodings["input_ids"][i], "attention_mask": train_encodings["attention_mask"][i], "labels": train_labels[i]} for i in range(len(train_labels))]
+        val_dataset = [{"input_ids": val_encodings["input_ids"][i], "attention_mask": val_encodings["attention_mask"][i], "labels": val_labels[i]} for i in range(len(val_labels))]
+
+        train_dataloader = DataLoader(train_dataset, batch_size=8, shuffle=True)
+        val_dataloader = DataLoader(val_dataset, batch_size=8, shuffle=False)
+
+        optimizer = Adam(model.parameters(), lr=5e-5)
+
+        num_epochs = 3
+        num_training_steps = num_epochs * len(train_dataloader)
+    
+        progress_bar = tqdm(range(num_training_steps))
+
+        model.train()
+        for epoch in range(num_epochs):
+            for batch in train_dataloader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                outputs = model(**batch)
+                loss = outputs.loss
+                loss.backward()
+
+                optimizer.step()
+                optimizer.zero_grad()
+                progress_bar.update(1)
+        
+        model.eval()
+        for batch in val_dataloader:
+            batch = {k: v.to(device) for k, v in batch.items()}
+            with torch.no_grad():
+                outputs = model(**batch)
+
+            logits = outputs.logits
+            predictions = torch.argmax(logits, dim=-1)
+            metric.add_batch(predictions=predictions.detach(), references=batch["labels"].detach())
+
+        results = metric.compute()
+        print(results)
+
+    def _loss(self, ins, dataset, prev_layer_gcn=None):
+        pred_inds = dataset.node_ids
+
+        prev_layer_gcn = prev_layer_gcn[pred_inds]
+        
+        if hasattr(self, 'llm') and \
+            self.pred_type not in ["sm_ensemble_mlp", "full_ensemble_mlp", "embed_ensemble_mlp", "avg_softmax_ensemble", "llm_embed_mlp"] :
+            vals = prev_layer_gcn[pred_inds]
+            with torch.no_grad():
+                llm_embs = self.llm.encode([dataset.docs[i] for i in pred_inds])
+            # llm_embs = torch.tensor(llm_embs, dtype=torch.float, device=FLAGS.device)
+            vals = torch.cat((vals, llm_embs), dim=1)
+        else:
+            vals = ins[pred_inds]
+
         if self.pred_type == 'softmax':
-            y_preds = ins[pred_inds]
+            y_preds = vals
         elif self.pred_type == 'mlp':
-            y_preds = self.mlp(ins[pred_inds])
+            y_preds = self.mlp(vals)
+        elif self.pred_type in  ["sm_ensemble_mlp", "full_ensemble_mlp", "avg_softmax_ensemble"]:
+            with torch.no_grad():
+                inputs = self.tokenizer([dataset.docs[i] for i in pred_inds], padding=True, truncation=True, max_length=512, return_tensors="pt")
+                llm_result = self.llm(**inputs)
+                llm_logits = llm_result.logits
+                llm_logits = F.softmax(llm_logits, dim=1)
+            assert llm_logits.shape[1] == self.num_labels
+            # llm_logits = torch.tensor(llm_logits, dtype=torch.float, device=FLAGS.device)
+            if self.pred_type == "full_ensemble_mlp":
+                with torch.no_grad():
+                    llm_embed = llm_result.hidden_states[-1].mean(dim=1)
+                inp = torch.cat((vals, prev_layer_gcn, llm_logits, llm_embed), dim=1)
+                y_preds = self.mlp(inp)
+            elif self.pred_type == "sm_ensemble_mlp":
+                y_preds = self.mlp(torch.cat((vals, llm_logits), dim=1))
+            elif self.pred_type == "avg_softmax_ensemble":
+                y_preds = (llm_logits + vals)/2
+        elif self.pred_type in ['embed_ensemble_mlp', 'llm_embed_mlp']:
+            inputs = self.tokenizer([dataset.docs[i] for i in pred_inds], padding=True, truncation=True, max_length=512, return_tensors="pt")
+            with torch.no_grad():
+                llm_result = self.llm(**inputs)
+                llm_embed = llm_result.hidden_states[-1].mean(dim=1)
+            if 'embed_ensemble_mlp':
+                y_preds = self.mlp(torch.cat((llm_embed, prev_layer_gcn), dim=1))
+            elif 'llm_embed_mlp':
+                y_preds = self.mlp(llm_embed)
         else:
             raise NotImplementedError
         y_true = torch.tensor(dataset.label_inds[pred_inds], dtype=torch.long, device=FLAGS.device)
@@ -54,6 +218,7 @@ class TextGNN(nn.Module):
         layers = nn.ModuleList()
         for i in range(self.num_layers):
             act = self.act if i < self.num_layers - 1 else 'identity'
+            # act = 'identity'
             layers.append(NodeEmbedding(
                 type=self.node_embd_type,
                 in_dim=self.layer_dim_list[i],

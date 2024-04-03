@@ -28,6 +28,7 @@ class TextDataset(object):
                             sentiment_labels.append("negative")
                     self.labels = sentiment_labels
         self.label_dict = {label: i for i, label in enumerate(list(set(self.labels)))}
+        self.id2label = {i: label for label, i in self.label_dict.items()}
         self.label_inds = np.asarray([self.label_dict[label] for label in self.labels])
         self.vocab = vocab
         self.word_id_map = word_id_map

@@ -41,7 +41,9 @@ def create_text_gnn(layer_info, dataset):
         bn=False,
         num_labels=len(dataset.label_dict),
         class_weights=weights,
-        dropout=layer_info["dropout"]
+        dropout=layer_info["dropout"],
+        llm=layer_info["llm"],
+        llm_model=layer_info["llm_model"],
     )
 
 

@@ -159,5 +159,5 @@ def build_word_doc_edges(doc_list):
 
 
 if __name__ == "__main__":
-    dataset = 'twitter_asian_prejudice'
+    dataset = 'babe-v3'
     build_text_graph_dataset(dataset, 20)
